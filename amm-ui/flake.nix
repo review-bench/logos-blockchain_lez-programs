@@ -1,5 +1,5 @@
 {
-  description = "Logos QML UI Module — replace with your description";
+  description = "Logos Swap — Decentralized, privacy preversed trading";
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";

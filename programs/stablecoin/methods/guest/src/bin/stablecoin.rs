@@ -12,12 +12,36 @@ mod stablecoin {
     #[allow(unused_imports)]
     use super::*;
 
+    /// Initialize the program-global stability-fee accumulator state.
+    ///
+    /// # Errors
+    /// Returns the host program's panic-converted error if any precondition fails.
+    #[instruction]
+    pub fn initialize_stability_fee_state(
+        ctx: ProgramContext,
+        authority: AccountWithMetadata,
+        stability_fee_state: AccountWithMetadata,
+        stability_fee_rate: u128,
+        current_timestamp: u64,
+    ) -> SpelResult {
+        let post_states =
+            stablecoin_program::initialize_stability_fee_state::initialize_stability_fee_state(
+                authority,
+                stability_fee_state,
+                ctx.self_program_id,
+                stability_fee_rate,
+                current_timestamp,
+            );
+        Ok(spel_framework::SpelOutput::execute(post_states, vec![]))
+    }
+
     /// Open a new collateral-only position for the calling owner.
     ///
     /// # Errors
     /// Returns the host program's panic-converted error if any precondition fails (see
     /// [`stablecoin_program::open_position::open_position`] for the full list).
     #[instruction]
+    #[allow(clippy::too_many_arguments)]
     pub fn open_position(
         ctx: ProgramContext,
         owner: AccountWithMetadata,
@@ -25,14 +49,18 @@ mod stablecoin {
         vault: AccountWithMetadata,
         user_holding: AccountWithMetadata,
         token_definition: AccountWithMetadata,
+        stability_fee_state: AccountWithMetadata,
         collateral_amount: u128,
     ) -> SpelResult {
         let (post_states, chained_calls) = stablecoin_program::open_position::open_position(
-            owner,
-            position,
-            vault,
-            user_holding,
-            token_definition,
+            stablecoin_program::open_position::OpenPositionAccounts {
+                owner,
+                position,
+                vault,
+                user_holding,
+                token_definition,
+                stability_fee_state,
+            },
             ctx.self_program_id,
             collateral_amount,
         );

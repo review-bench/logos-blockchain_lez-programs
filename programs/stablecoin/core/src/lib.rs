@@ -2,21 +2,48 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use nssa_core::{
-    account::{AccountId, AccountWithMetadata, Data},
+    account::{Account, AccountId, AccountWithMetadata, Data},
     program::{PdaSeed, ProgramId},
 };
 use serde::{Deserialize, Serialize};
 use spel_framework_macros::account_type;
 
+mod stability_fee;
+
+#[cfg(test)]
+mod tests;
+
+pub use stability_fee::{
+    accrue_position_stability_fee, accrue_stability_fees, accrued_debt_amount,
+    apply_debt_change_after_fee_accrual, collateralization_ratio_bps,
+    ensure_minimum_collateralization, stability_fee_growth_factor, DebtChange, StabilityFeeError,
+    StabilityFeeState, COLLATERALIZATION_RATIO_BPS_DENOMINATOR, FEE_ACCUMULATOR_SCALE,
+};
+
 const POSITION_PDA_DOMAIN: [u8; 32] = [0; 32];
 const POSITION_VAULT_PDA_DOMAIN: [u8; 32] = [1; 32];
+const STABILITY_FEE_STATE_PDA_DOMAIN: [u8; 32] = [2; 32];
 
 /// Stablecoin Program Instruction.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Instruction {
+    /// Initialize the program-global [`StabilityFeeState`] account.
+    ///
+    /// Required accounts (2):
+    /// - Stability-fee authority account (authorized; not yet bound to a designated governance
+    ///   identity — see `initialize_stability_fee_state`, treat as a trusted bootstrap step)
+    /// - Program-global [`StabilityFeeState`] account (uninitialized, address must match
+    ///   `compute_stability_fee_state_pda(self_program_id)`)
+    InitializeStabilityFeeState {
+        /// Fixed-point stability fee rate per timestamp unit.
+        stability_fee_rate: u128,
+        /// Initial accumulator timestamp.
+        current_timestamp: u64,
+    },
+
     /// Open a new collateral-only [`Position`] for the calling owner.
     ///
-    /// Required accounts (5):
+    /// Required accounts (6):
     /// - Owner account (authorized)
     /// - Position account (uninitialized, address must match
     ///   `compute_position_pda(self_program_id, owner, token_definition)`)
@@ -26,6 +53,8 @@ pub enum Instruction {
     /// - Token definition account for the collateral (matches the user holding's `definition_id`;
     ///   its `program_owner` determines the Token Program used by the chained `InitializeAccount`
     ///   / `Transfer` calls)
+    /// - Program-global [`StabilityFeeState`] account (initialized, address must match
+    ///   `compute_stability_fee_state_pda(self_program_id)`)
     OpenPosition {
         /// Amount of collateral tokens to deposit into the position vault.
         collateral_amount: u128,
@@ -80,8 +109,10 @@ pub enum Instruction {
 
 /// Persistent state held by a Stablecoin [`Position`] account.
 ///
-/// `debt_amount` is included for forward compatibility with `generate_debt`; until that
-/// instruction lands `open_position` always initializes it to `0`.
+/// `debt_amount` is nominal debt, and `fee_accumulator` is the global stability-fee accumulator
+/// snapshot used when this position was last settled. `open_position` initializes `debt_amount`
+/// to `0` and snapshots the initialized global accumulator; drawing debt is deferred to a future
+/// `generate_debt` instruction.
 #[account_type]
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Position {
@@ -91,8 +122,10 @@ pub struct Position {
     pub collateral_definition_id: AccountId,
     /// Amount of collateral tokens deposited.
     pub collateral_amount: u128,
-    /// Outstanding stablecoin debt against this position.
+    /// Outstanding nominal stablecoin debt against this position.
     pub debt_amount: u128,
+    /// Global stability-fee accumulator value at the last position fee settlement.
+    pub fee_accumulator: u128,
 }
 
 impl TryFrom<&Data> for Position {
@@ -211,4 +244,70 @@ pub fn verify_position_vault_and_get_seed(
         "Position vault account ID does not match expected derivation"
     );
     seed
+}
+
+/// PDA seed for the program-global [`StabilityFeeState`] singleton account.
+///
+/// The stablecoin program holds exactly one stability-fee state, so the seed is derived
+/// solely from a domain-separation tag with no per-caller input.
+pub fn compute_stability_fee_state_pda_seed() -> PdaSeed {
+    use risc0_zkvm::sha::{Impl, Sha256 as _};
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(Impl::hash_bytes(&STABILITY_FEE_STATE_PDA_DOMAIN).as_bytes());
+    PdaSeed::new(out)
+}
+
+/// Account id of the program-global [`StabilityFeeState`] PDA under `stablecoin_program_id`.
+pub fn compute_stability_fee_state_pda(stablecoin_program_id: ProgramId) -> AccountId {
+    AccountId::for_public_pda(
+        &stablecoin_program_id,
+        &compute_stability_fee_state_pda_seed(),
+    )
+}
+
+/// Verify the stability-fee state account's address matches the program-global PDA and
+/// return the [`PdaSeed`] for use in post-state claims.
+///
+/// # Panics
+/// If `stability_fee_state.account_id` does not match the address derived from
+/// `stablecoin_program_id`.
+pub fn verify_stability_fee_state_and_get_seed(
+    stability_fee_state: &AccountWithMetadata,
+    stablecoin_program_id: ProgramId,
+) -> PdaSeed {
+    let seed = compute_stability_fee_state_pda_seed();
+    let expected_id = AccountId::for_public_pda(&stablecoin_program_id, &seed);
+    assert_eq!(
+        stability_fee_state.account_id, expected_id,
+        "Stability fee state account ID does not match expected derivation"
+    );
+    seed
+}
+
+/// Verify the stability-fee state account is the initialized, program-owned global PDA, and
+/// return its [`PdaSeed`] (for post-state claims) together with the decoded [`StabilityFeeState`].
+///
+/// # Panics
+/// - `stability_fee_state.account_id` does not match the program-global PDA.
+/// - the account is uninitialized.
+/// - the account is not owned by this Stablecoin Program.
+/// - the account data cannot be decoded as a [`StabilityFeeState`].
+pub fn verify_initialized_stability_fee_state(
+    stability_fee_state: &AccountWithMetadata,
+    stablecoin_program_id: ProgramId,
+) -> (PdaSeed, StabilityFeeState) {
+    let seed = verify_stability_fee_state_and_get_seed(stability_fee_state, stablecoin_program_id);
+    assert_ne!(
+        stability_fee_state.account,
+        Account::default(),
+        "Stability fee state account must be initialized"
+    );
+    assert_eq!(
+        stability_fee_state.account.program_owner, stablecoin_program_id,
+        "Stability fee state account is not owned by this Stablecoin Program"
+    );
+    let fee_state = StabilityFeeState::try_from(&stability_fee_state.account.data)
+        .expect("Stability fee state account must hold valid StabilityFeeState data");
+    (seed, fee_state)
 }

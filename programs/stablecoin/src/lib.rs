@@ -2,6 +2,9 @@
 
 pub use stablecoin_core as core;
 
+/// Initialize the program-global stability-fee accumulator state.
+pub mod initialize_stability_fee_state;
+
 /// Open a new collateral-only position for a calling owner.
 pub mod open_position;
 

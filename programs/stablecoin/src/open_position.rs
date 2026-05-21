@@ -2,8 +2,21 @@ use nssa_core::{
     account::{Account, AccountWithMetadata, Data},
     program::{AccountPostState, ChainedCall, Claim, ProgramId},
 };
-use stablecoin_core::{verify_position_and_get_seed, verify_position_vault_and_get_seed, Position};
+use stablecoin_core::{
+    verify_initialized_stability_fee_state, verify_position_and_get_seed,
+    verify_position_vault_and_get_seed, Position,
+};
 use token_core::TokenHolding;
+
+/// Accounts consumed by [`open_position`].
+pub struct OpenPositionAccounts {
+    pub owner: AccountWithMetadata,
+    pub position: AccountWithMetadata,
+    pub vault: AccountWithMetadata,
+    pub user_holding: AccountWithMetadata,
+    pub token_definition: AccountWithMetadata,
+    pub stability_fee_state: AccountWithMetadata,
+}
 
 /// Open a new collateral-only position for `owner`.
 ///
@@ -13,25 +26,32 @@ use token_core::TokenHolding;
 /// 2. `Transfer` moves `collateral_amount` collateral tokens from the user's holding into the
 ///    freshly initialized vault.
 ///
-/// `debt_amount` is deferred to a future `generate_debt` instruction and is intentionally
-/// not parameterized here.
+/// The new position is debt-free and snapshots the initialized global
+/// [`stablecoin_core::StabilityFeeState`] accumulator. Drawing debt is deferred to a future
+/// `generate_debt` instruction.
 ///
 /// # Panics
 /// - `owner` or `user_holding` is not authorized.
 /// - `position` or `vault` is already initialized.
 /// - `position.account_id` / `vault.account_id` do not match their PDA derivations.
+/// - `stability_fee_state` is not the initialized, program-owned global PDA.
 /// - `user_holding` cannot be decoded as a [`TokenHolding`].
 /// - `user_holding`'s definition does not match `token_definition`.
 /// - `token_definition.program_owner` does not match `user_holding.program_owner`.
 pub fn open_position(
-    owner: AccountWithMetadata,
-    position: AccountWithMetadata,
-    vault: AccountWithMetadata,
-    user_holding: AccountWithMetadata,
-    token_definition: AccountWithMetadata,
+    accounts: OpenPositionAccounts,
     stablecoin_program_id: ProgramId,
     collateral_amount: u128,
 ) -> (Vec<AccountPostState>, Vec<ChainedCall>) {
+    let OpenPositionAccounts {
+        owner,
+        position,
+        vault,
+        user_holding,
+        token_definition,
+        stability_fee_state,
+    } = accounts;
+
     assert!(owner.is_authorized, "Owner authorization is missing");
     assert!(
         user_holding.is_authorized,
@@ -69,6 +89,8 @@ pub fn open_position(
     );
     let vault_seed =
         verify_position_vault_and_get_seed(&vault, position.account_id, stablecoin_program_id);
+    let (_, fee_state) =
+        verify_initialized_stability_fee_state(&stability_fee_state, stablecoin_program_id);
 
     let mut position_post = position.account;
     position_post.data = Data::from(&Position {
@@ -76,6 +98,7 @@ pub fn open_position(
         collateral_definition_id: token_definition.account_id,
         collateral_amount,
         debt_amount: 0,
+        fee_accumulator: fee_state.stability_fee_accumulator,
     });
 
     let post_states = vec![
@@ -84,6 +107,7 @@ pub fn open_position(
         AccountPostState::new(vault.account.clone()),
         AccountPostState::new(user_holding.account.clone()),
         AccountPostState::new(token_definition.account.clone()),
+        AccountPostState::new(stability_fee_state.account),
     ];
 
     // Chained Token::InitializeAccount owns the vault as a Token holding. The Stablecoin

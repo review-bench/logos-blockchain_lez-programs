@@ -3,7 +3,10 @@ use nssa::{
     public_transaction, PrivateKey, PublicKey, PublicTransaction, V03State,
 };
 use nssa_core::account::{Account, AccountId, Data, Nonce};
-use stablecoin_core::{compute_position_pda, compute_position_vault_pda, Position};
+use stablecoin_core::{
+    compute_position_pda, compute_position_vault_pda, compute_stability_fee_state_pda, Position,
+    StabilityFeeState, FEE_ACCUMULATOR_SCALE,
+};
 use token_core::{TokenDefinition, TokenHolding};
 
 struct Keys;
@@ -66,6 +69,10 @@ impl Ids {
 
     fn vault() -> AccountId {
         compute_position_vault_pda(Self::stablecoin_program(), Self::position())
+    }
+
+    fn stability_fee_state() -> AccountId {
+        compute_stability_fee_state_pda(Self::stablecoin_program())
     }
 }
 
@@ -138,6 +145,15 @@ impl Accounts {
         }
     }
 
+    fn stability_fee_state_init() -> Account {
+        Account {
+            program_owner: stablecoin_methods::STABLECOIN_ID,
+            balance: 0_u128,
+            data: Data::from(&StabilityFeeState::new(FEE_ACCUMULATOR_SCALE / 100, 0)),
+            nonce: Nonce(0),
+        }
+    }
+
     fn user_stablecoin_holding_init() -> Account {
         Account {
             program_owner: Ids::token_program(),
@@ -159,6 +175,7 @@ impl Accounts {
                 collateral_definition_id: Ids::collateral_definition(),
                 collateral_amount: Balances::collateral_deposit(),
                 debt_amount: Balances::initial_debt(),
+                fee_accumulator: FEE_ACCUMULATOR_SCALE,
             }),
             nonce: Nonce(0),
         }
@@ -191,6 +208,10 @@ fn state_for_stablecoin_tests() -> V03State {
         Accounts::collateral_definition_init(),
     );
     state.force_insert_account(Ids::user_holding(), Accounts::user_holding_init());
+    state.force_insert_account(
+        Ids::stability_fee_state(),
+        Accounts::stability_fee_state_init(),
+    );
     state
 }
 
@@ -213,6 +234,10 @@ fn state_for_stablecoin_repay_tests() -> V03State {
     state.force_insert_account(
         Ids::user_stablecoin_holding(),
         Accounts::user_stablecoin_holding_init(),
+    );
+    state.force_insert_account(
+        Ids::stability_fee_state(),
+        Accounts::stability_fee_state_init(),
     );
     state
 }
@@ -262,6 +287,7 @@ fn stablecoin_open_position_then_withdraw_collateral() {
             Ids::vault(),
             Ids::user_holding(),
             Ids::collateral_definition(),
+            Ids::stability_fee_state(),
         ],
         vec![
             current_nonce(&state, Ids::owner()),

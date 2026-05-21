@@ -102,6 +102,7 @@ pub fn repay_debt(
         collateral_definition_id: position_data.collateral_definition_id,
         collateral_amount: position_data.collateral_amount,
         debt_amount: new_debt,
+        fee_accumulator: position_data.fee_accumulator,
     };
     let mut position_post = position.account.clone();
     position_post.data = Data::from(&updated_position);

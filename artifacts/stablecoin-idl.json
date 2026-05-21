@@ -3,6 +3,33 @@
   "name": "stablecoin",
   "instructions": [
     {
+      "name": "initialize_stability_fee_state",
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": false,
+          "signer": false,
+          "init": false
+        },
+        {
+          "name": "stability_fee_state",
+          "writable": false,
+          "signer": false,
+          "init": false
+        }
+      ],
+      "args": [
+        {
+          "name": "stability_fee_rate",
+          "type": "u128"
+        },
+        {
+          "name": "current_timestamp",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "open_position",
       "accounts": [
         {
@@ -31,6 +58,12 @@
         },
         {
           "name": "token_definition",
+          "writable": false,
+          "signer": false,
+          "init": false
+        },
+        {
+          "name": "stability_fee_state",
           "writable": false,
           "signer": false,
           "init": false
@@ -116,6 +149,26 @@
   ],
   "accounts": [
     {
+      "name": "StabilityFeeState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "stability_fee_accumulator",
+            "type": "u128"
+          },
+          {
+            "name": "stability_fee_rate",
+            "type": "u128"
+          },
+          {
+            "name": "last_fee_update_timestamp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "Position",
       "type": {
         "kind": "struct",
@@ -134,6 +187,10 @@
           },
           {
             "name": "debt_amount",
+            "type": "u128"
+          },
+          {
+            "name": "fee_accumulator",
             "type": "u128"
           }
         ]

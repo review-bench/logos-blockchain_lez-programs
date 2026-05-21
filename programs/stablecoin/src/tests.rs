@@ -11,7 +11,8 @@ use nssa_core::{
 };
 use stablecoin_core::{
     compute_position_pda, compute_position_pda_seed, compute_position_vault_pda,
-    compute_position_vault_pda_seed, Position,
+    compute_position_vault_pda_seed, compute_stability_fee_state_pda,
+    compute_stability_fee_state_pda_seed, Position, StabilityFeeState, FEE_ACCUMULATOR_SCALE,
 };
 use token_core::{TokenDefinition, TokenHolding};
 
@@ -70,6 +71,14 @@ fn owner_account() -> AccountWithMetadata {
     }
 }
 
+fn stability_fee_authority_account() -> AccountWithMetadata {
+    AccountWithMetadata {
+        account: Account::default(),
+        is_authorized: true,
+        account_id: AccountId::new([0x40u8; 32]),
+    }
+}
+
 fn collateral_definition_account() -> AccountWithMetadata {
     AccountWithMetadata {
         account: Account {
@@ -123,6 +132,7 @@ fn init_position_account(collateral_amount: u128, debt_amount: u128) -> AccountW
                 collateral_definition_id: collateral_definition_id(),
                 collateral_amount,
                 debt_amount,
+                fee_accumulator: FEE_ACCUMULATOR_SCALE,
             }),
             nonce: Nonce(0),
         },
@@ -174,20 +184,134 @@ fn user_stablecoin_holding_account(balance: u128) -> AccountWithMetadata {
     account
 }
 
+fn stability_fee_state_id() -> AccountId {
+    compute_stability_fee_state_pda(STABLECOIN_PROGRAM_ID)
+}
+
+fn uninit_stability_fee_state_account() -> AccountWithMetadata {
+    AccountWithMetadata {
+        account: Account::default(),
+        is_authorized: false,
+        account_id: stability_fee_state_id(),
+    }
+}
+
+fn initialized_stability_fee_state_account(state: &StabilityFeeState) -> AccountWithMetadata {
+    AccountWithMetadata {
+        account: Account {
+            program_owner: STABLECOIN_PROGRAM_ID,
+            balance: 0,
+            data: Data::from(state),
+            nonce: Nonce(0),
+        },
+        is_authorized: false,
+        account_id: stability_fee_state_id(),
+    }
+}
+
+fn default_stability_fee_state_account() -> AccountWithMetadata {
+    initialized_stability_fee_state_account(&StabilityFeeState::default())
+}
+
+fn open_position_accounts(
+    owner: AccountWithMetadata,
+    position: AccountWithMetadata,
+    vault: AccountWithMetadata,
+    user_holding: AccountWithMetadata,
+    token_definition: AccountWithMetadata,
+    stability_fee_state: AccountWithMetadata,
+) -> crate::open_position::OpenPositionAccounts {
+    crate::open_position::OpenPositionAccounts {
+        owner,
+        position,
+        vault,
+        user_holding,
+        token_definition,
+        stability_fee_state,
+    }
+}
+
+// --- initialize_stability_fee_state ------------------------------------------------------
+
+#[test]
+fn initialize_stability_fee_state_claims_pda_and_sets_rate() {
+    let stability_fee_rate = FEE_ACCUMULATOR_SCALE / 100;
+    let current_timestamp = 42;
+
+    let post_states = crate::initialize_stability_fee_state::initialize_stability_fee_state(
+        stability_fee_authority_account(),
+        uninit_stability_fee_state_account(),
+        STABLECOIN_PROGRAM_ID,
+        stability_fee_rate,
+        current_timestamp,
+    );
+
+    assert_eq!(post_states.len(), 2);
+    assert_eq!(post_states[0].required_claim(), None);
+    assert_eq!(
+        post_states[1].required_claim(),
+        Some(Claim::Pda(compute_stability_fee_state_pda_seed()))
+    );
+    assert_eq!(
+        post_states[1].account().program_owner,
+        STABLECOIN_PROGRAM_ID
+    );
+    assert_eq!(
+        StabilityFeeState::try_from(&post_states[1].account().data).expect("valid fee state"),
+        StabilityFeeState::new(stability_fee_rate, current_timestamp)
+    );
+}
+
+#[test]
+#[should_panic(expected = "Stability fee authority authorization is missing")]
+fn initialize_stability_fee_state_requires_authority() {
+    let mut authority = stability_fee_authority_account();
+    authority.is_authorized = false;
+
+    crate::initialize_stability_fee_state::initialize_stability_fee_state(
+        authority,
+        uninit_stability_fee_state_account(),
+        STABLECOIN_PROGRAM_ID,
+        FEE_ACCUMULATOR_SCALE / 100,
+        42,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Stability fee state account must be uninitialized")]
+fn initialize_stability_fee_state_rejects_initialized_state() {
+    crate::initialize_stability_fee_state::initialize_stability_fee_state(
+        stability_fee_authority_account(),
+        initialized_stability_fee_state_account(&StabilityFeeState::default()),
+        STABLECOIN_PROGRAM_ID,
+        FEE_ACCUMULATOR_SCALE / 100,
+        42,
+    );
+}
+
+// --- open_position -----------------------------------------------------------------------
+
 #[test]
 fn open_position_claims_pda_and_emits_chained_calls() {
     let collateral_amount: u128 = 500;
     let (post_states, chained_calls) = crate::open_position::open_position(
-        owner_account(),
-        uninit_position_account(),
-        uninit_vault_account(),
-        user_holding_account(1_000),
-        collateral_definition_account(),
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            initialized_stability_fee_state_account(&StabilityFeeState {
+                stability_fee_accumulator: FEE_ACCUMULATOR_SCALE + 123,
+                stability_fee_rate: FEE_ACCUMULATOR_SCALE / 100,
+                last_fee_update_timestamp: 42,
+            }),
+        ),
         STABLECOIN_PROGRAM_ID,
         collateral_amount,
     );
 
-    assert_eq!(post_states.len(), 5);
+    assert_eq!(post_states.len(), 6);
 
     // Position is PDA-claimed and carries the encoded Position state.
     let position_post = &post_states[1];
@@ -206,10 +330,20 @@ fn open_position_claims_pda_and_emits_chained_calls() {
             collateral_definition_id: collateral_definition_id(),
             collateral_amount,
             debt_amount: 0,
+            fee_accumulator: FEE_ACCUMULATOR_SCALE + 123,
         }
     );
     // The runtime sets the program_owner on the claimed account after validating Claim::Pda.
     assert_eq!(position_post.account().program_owner, ProgramId::default());
+    assert_eq!(
+        post_states[5].account(),
+        &initialized_stability_fee_state_account(&StabilityFeeState {
+            stability_fee_accumulator: FEE_ACCUMULATOR_SCALE + 123,
+            stability_fee_rate: FEE_ACCUMULATOR_SCALE / 100,
+            last_fee_update_timestamp: 42,
+        })
+        .account
+    );
 
     assert_eq!(chained_calls.len(), 2);
 
@@ -247,17 +381,37 @@ fn open_position_claims_pda_and_emits_chained_calls() {
 }
 
 #[test]
+#[should_panic(expected = "Stability fee state account must be initialized")]
+fn open_position_rejects_uninitialized_stability_fee_state() {
+    crate::open_position::open_position(
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            uninit_stability_fee_state_account(),
+        ),
+        STABLECOIN_PROGRAM_ID,
+        500,
+    );
+}
+
+#[test]
 #[should_panic(expected = "Owner authorization is missing")]
 fn open_position_requires_owner_authorization() {
     let mut owner = owner_account();
     owner.is_authorized = false;
 
     crate::open_position::open_position(
-        owner,
-        uninit_position_account(),
-        uninit_vault_account(),
-        user_holding_account(1_000),
-        collateral_definition_account(),
+        open_position_accounts(
+            owner,
+            uninit_position_account(),
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -270,11 +424,14 @@ fn open_position_requires_user_holding_authorization() {
     holding.is_authorized = false;
 
     crate::open_position::open_position(
-        owner_account(),
-        uninit_position_account(),
-        uninit_vault_account(),
-        holding,
-        collateral_definition_account(),
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            uninit_vault_account(),
+            holding,
+            collateral_definition_account(),
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -292,6 +449,7 @@ fn open_position_rejects_initialized_position() {
                 collateral_definition_id: collateral_definition_id(),
                 collateral_amount: 1,
                 debt_amount: 0,
+                fee_accumulator: FEE_ACCUMULATOR_SCALE,
             }),
             nonce: Nonce(0),
         },
@@ -300,11 +458,14 @@ fn open_position_rejects_initialized_position() {
     };
 
     crate::open_position::open_position(
-        owner_account(),
-        position,
-        uninit_vault_account(),
-        user_holding_account(1_000),
-        collateral_definition_account(),
+        open_position_accounts(
+            owner_account(),
+            position,
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -328,11 +489,14 @@ fn open_position_rejects_initialized_vault() {
     };
 
     crate::open_position::open_position(
-        owner_account(),
-        uninit_position_account(),
-        vault,
-        user_holding_account(1_000),
-        collateral_definition_account(),
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            vault,
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -348,11 +512,14 @@ fn open_position_rejects_wrong_position_address() {
     };
 
     crate::open_position::open_position(
-        owner_account(),
-        bad_position,
-        uninit_vault_account(),
-        user_holding_account(1_000),
-        collateral_definition_account(),
+        open_position_accounts(
+            owner_account(),
+            bad_position,
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -368,11 +535,14 @@ fn open_position_rejects_wrong_vault_address() {
     };
 
     crate::open_position::open_position(
-        owner_account(),
-        uninit_position_account(),
-        bad_vault,
-        user_holding_account(1_000),
-        collateral_definition_account(),
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            bad_vault,
+            user_holding_account(1_000),
+            collateral_definition_account(),
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -397,11 +567,14 @@ fn open_position_rejects_mismatched_token_definition() {
     };
 
     crate::open_position::open_position(
-        owner_account(),
-        uninit_position_account(),
-        uninit_vault_account(),
-        user_holding_account(1_000),
-        other_definition,
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            other_definition,
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
@@ -416,15 +589,20 @@ fn open_position_rejects_definition_with_wrong_token_program() {
     definition.account.program_owner = [9u32; 8];
 
     crate::open_position::open_position(
-        owner_account(),
-        uninit_position_account(),
-        uninit_vault_account(),
-        user_holding_account(1_000),
-        definition,
+        open_position_accounts(
+            owner_account(),
+            uninit_position_account(),
+            uninit_vault_account(),
+            user_holding_account(1_000),
+            definition,
+            default_stability_fee_state_account(),
+        ),
         STABLECOIN_PROGRAM_ID,
         500,
     );
 }
+
+// --- PDA derivation ----------------------------------------------------------------------
 
 #[test]
 fn position_pda_is_deterministic_and_owner_and_collateral_specific() {
@@ -495,6 +673,7 @@ fn withdraw_collateral_updates_position_and_emits_transfer() {
             collateral_definition_id: collateral_definition_id(),
             collateral_amount: initial_collateral - amount,
             debt_amount: 0,
+            fee_accumulator: FEE_ACCUMULATOR_SCALE,
         }
     );
     assert_eq!(position_post.account().program_owner, STABLECOIN_PROGRAM_ID);
@@ -763,6 +942,7 @@ fn repay_debt_decreases_debt_and_emits_burn() {
             collateral_definition_id: collateral_definition_id(),
             collateral_amount: initial_collateral,
             debt_amount: initial_debt - amount,
+            fee_accumulator: FEE_ACCUMULATOR_SCALE,
         }
     );
     assert_eq!(position_post.account().program_owner, STABLECOIN_PROGRAM_ID);

@@ -103,6 +103,7 @@ pub fn withdraw_collateral(
         collateral_definition_id: position_data.collateral_definition_id,
         collateral_amount: new_collateral,
         debt_amount: position_data.debt_amount,
+        fee_accumulator: position_data.fee_accumulator,
     };
     let mut position_post = position.account.clone();
     position_post.data = Data::from(&updated_position);
